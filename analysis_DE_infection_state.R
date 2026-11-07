@@ -1,222 +1,188 @@
 ## =============================================================================
-## Differential expression across HCMV infection states in primary HOKs
-## Implements the edgeR DE step in the Methods of:
-##   "Human Cytomegalovirus Infection of Primary Human Oral Keratinocytes Induces
-##    Intermediate Keratinocyte Differentiation and an Altered Innate Immune
-##    Response" (PMID 41000686; bioRxiv 10.1101/2025.09.16.676604)
+## Reproduce Fig. 4 edgeR DE results (*_edgeRDEresults.tsv) from cmv.srt.soupx.filt.rds
 ##
-## Input : analysis_Robjects/cmv.srt.soupx.filt.rds
-##         (output of analysis_soupx_sample_processing.R)
+## Methods: edgeR (glmFit / glmLRT) via SignallingSingleCell findDEgenes() + edgeRDE().
+##   HCMV genes removed; genes expressed (>0) in >10% of the tested cells kept;
+##   significant = |log2FC| > 1 & FDR < 0.05.
 ##
-## Methods being reproduced:
-##   - Infection state per cell (Fig 3A/B):
-##       Mock      : cells from Mock samples
-##       Bystander : cells in infected samples with 0 viral UMIs
-##       Marginal / High : virus+ cells split by a per-sample threshold at the
-##                         first local minimum of the density of
-##                         log10(% viral transcripts + min non-zero %)
-##                         (BROOKELAB/SingleCell Run_filter_and_count_virus_cal07.R)
-##   - DE (Fig 4A-D): edgeR; HCMV genes removed; genes detected in >=10% of the
-##     tested cells; DEG = |log2FC| > 1 and FDR < 0.05
+## Fig. 4 comparisons (groups from Infection_state_bkgd):
+##   Mock vs highly infected       -> 6_Infected_edgeRDEresults.tsv       (Infected vs Mock)
+##   Mock vs marginally infected   -> 5_Bystander_bkgd_edgeRDEresults.tsv (Marginal vs Mock)
+##   Mock vs bystander             -> 4_Bystander_edgeRDEresults.tsv      (Bystander vs Mock)
+##   Bystander vs highly infected  -> 1_Infected_edgeRDEresults.tsv       (Infected vs Bystander)
+##
+## Each test: cells in `cells` are tested; contrastID cells vs all other tested
+## cells (logFC = log2(contrastID / rest)), no batch term.
+##
+## Usage: Rscript analysis_DE_infection_state.R      (writes DE_repro/results/*.tsv + report)
 ## =============================================================================
 
 suppressPackageStartupMessages({
   library(Seurat)
   library(Matrix)
+  library(Biobase)
   library(edgeR)
-  library(ggplot2)
-  library(ggrepel)
-  library(dplyr)
 })
-set.seed(1)
+setwd("~/hcmv")
+OUTDIR <- "DE_repro/results/"
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
 
-outdir <- "DE_infection_state"
-dir.create(outdir, showWarnings = FALSE)
-dir.create(file.path(outdir, "plots"), showWarnings = FALSE)
+## ---- SignallingSingleCell (ee0dac6), verbatim -------------------------------
+construct_ex_sc <- function(input){
+  HSMM_expr_matrix <- input
+  num.columns <- ncol(HSMM_expr_matrix)
+  name.columns <- colnames(HSMM_expr_matrix)
+  num.rows <- nrow(HSMM_expr_matrix)
+  name.rows <- rownames(HSMM_expr_matrix)
+  HSMM_sample_sheet <- matrix(nrow = num.columns, ncol= 0)
+  rownames(HSMM_sample_sheet) <- c(name.columns)
+  HSMM_sample_sheet <- data.frame(HSMM_sample_sheet)
+  HSMM_gene_annotation <- matrix(nrow = num.rows, ncol= 0)
+  rownames(HSMM_gene_annotation) <- c(name.rows)
+  HSMM_gene_annotation <- data.frame(HSMM_gene_annotation)
+  pd <- new("AnnotatedDataFrame", data = HSMM_sample_sheet)
+  fd <- new("AnnotatedDataFrame", data = HSMM_gene_annotation)
+  ex_sc <- ExpressionSet(as.matrix(HSMM_expr_matrix), phenoData = pd, featureData = fd)
+  return(ex_sc)
+}
 
-## ---- parameters (from Methods) ---------------------------------------------
-min.pct  <- 0.10   # gene detected (count > 0) in >= 10% of tested cells
-lfc.cut  <- 1      # |log2FC| > 1  (two-fold)
-fdr.cut  <- 0.05
+edgeRDE <- function(input, groups, batch, sizefactor, lib_size, minCells,
+                    pVal = 1, contrast = list(c(-1,1))) {
+  ## remove any zero-variance genes
+  rvar <- apply(exprs(input),1,var)
+  idx.keep <- which(rvar>0)
+  input <- input[idx.keep,]
+  ## remove genes expressed in less than minCells fraction of the cells
+  gfrac <- apply(exprs(input),1,function(a) length(a[a>0])/length(a))
+  idx.keep <- which(gfrac>minCells)
+  input <- input[idx.keep,]
+  ## make DGElist
+  y <- edgeR::DGEList(counts=exprs(input), group=groups)
+  y$samples$lib.size <- lib_size          # library size BEFORE gene filtering
+  if (is.null(sizefactor)) {
+    message(sprintf('Calculating norm factors...'));flush.console()
+    y <- edgeR::calcNormFactors(y)
+  } else {
+    y$samples$norm.factors = pData(input)[,sizefactor]/lib_size
+  }
+  if (length(unique(batch))>1) {
+    design <- model.matrix(~0+batch+group, data=y$samples)
+  } else {
+    design <- model.matrix(~0+group, data=y$samples)
+  }
+  message('Estimating dispersion...');flush.console()
+  y <- edgeR::estimateDisp(y, design)
+  message('Doing likelihood ratio fit...');flush.console()
+  fit <- edgeR::glmFit(y, design)
+  tab <- list()
+  if (length(unique(batch))>1) {
+    lrt <- edgeR::glmLRT(fit)
+    tab[['contrast_1']] <- as.data.frame(edgeR::topTags(lrt, p.value=pVal, n=Inf, sort.by='logFC'))
+  } else {
+    for (j in 1:length(contrast)) {
+      cStr <- sprintf('contrast_%d', j)
+      lrt <- edgeR::glmLRT(fit, contrast=contrast[[j]])
+      tab[[cStr]] <- as.data.frame(edgeR::topTags(lrt, p.value=pVal, n=Inf, sort.by='logFC'))
+    }
+  }
+  return(tab)
+}
 
-## Set TRUE to reuse an existing obj$Infection_state column
-## (values must be Mock / Bystander / Marginal / High)
-use.existing.states <- FALSE
+findDEgenes = function(input, pd = pData(input), DEgroup, contrastID, sizefactor = NULL,
+                       lib_size = NULL, facet_by, minCells = 0.1, batchID = NULL,
+                       outdir = "DEresults/", outsuffix = "DEresults.tsv", pVal = 1,
+                       contrast = list(c(-1,1))) {
+  for (i in 1:length(unique(pd[,facet_by]))) {
+    name = sort(unique(as.character(pd[,facet_by])))[i]
+    print(paste0("Performing DE for ", name))
+    idx = rownames(pd)[which(pd[,facet_by]==name)]
+    cntr = rownames(pd)[which(pd[,facet_by]==name & pd[,DEgroup]==contrastID)]
+    z = as.matrix(exprs(input))[,idx]
+    if(ncol(z) > 2){
+      if (is.null(lib_size)) {
+        lib_size = colSums(exprs(input))  # input must contain only the tested cells
+      } else {
+        lib_size = pd[idx,lib_size]
+      }
+      if (is.null(batchID)) {
+        batch = as.factor(rep(1,ncol(input)))
+      } else {
+        batch = as.factor(pd[idx,batchID])
+      }
+      groupList = rep(0, times=ncol(z))
+      groupList[which(colnames(z) %in% cntr)] = 1
+      if(length(unique(groupList)) > 1){
+        group = factor(groupList)
+        z = construct_ex_sc(z)
+        pData(z) = pd[idx,,drop=F]
+        tab = edgeRDE(input = z, groups = group, batch = batch, sizefactor = sizefactor, lib_size = lib_size,
+                      minCells = minCells, pVal = pVal, contrast = contrast)
+        DEtablecntr = tab[['contrast_1']]
+        outfile = paste(name, contrastID, outsuffix, sep = "_")
+        write.table(DEtablecntr, paste(outdir, outfile, sep = ""), sep = "\t")
+      } else {
+        stop("Only one group in comparison")
+      }
+    }
+  }
+}
 
-## Optional manual per-sample thresholds on the log10(% viral + fudge) scale,
-## to override the automatic local-minimum call, e.g.
-## manual.thr <- c("Exp213_TB_3dpi" = -1.2)
-manual.thr <- c()
-
-## ---- load ------------------------------------------------------------------
-obj <- readRDS("analysis_Robjects/cmv.srt.soupx.filt.rds")
-obj <- JoinLayers(obj)
-
-cmv.names <- read.table("../merlin.gene.names")$V1
-cmv.names <- gsub("_", "-", c(cmv.names, "EGFP"))
-cmv.names <- c(cmv.names, "RNA5.0", "RNA4.9", "RNA1.2", "RNA2.7")
-
+## ---- data: SoupX counts, HCMV genes removed ---------------------------------
+obj <- readRDS("cmv.srt.soupx.filt.rds")
+obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
+counts <- GetAssayData(obj, assay = "RNA", layer = "counts")
 md <- obj@meta.data
-md$is_mock <- grepl("Mock", md$orig.ident)
+rm(obj); invisible(gc())
 
-## ---- infection state -------------------------------------------------------
-if (use.existing.states && "Infection_state" %in% colnames(md)) {
-  message("Using existing Infection_state column")
-} else {
-  # Threshold method from BROOKELAB/SingleCell Run_filter_and_count_virus_cal07.R:
-  #   halfmin_virus <- min(virus_pct[virus_pct > 0])
-  #   virus_pct_log10 <- log10(virus_pct + halfmin_virus)
-  #   des <- density(virus_pct_log10)                       # default bandwidth
-  #   mins <- des$x[which(diff(sign(diff(des$y))) == 2) + 1]
-  #   infected = virus_pct_log10 > mins[1]
-  # Applied per infected sample to virus+ cells (paper Fig 3A).
-  fudge <- min(md$percent.cmv[md$percent.cmv > 0])   # = halfmin_virus
-  md$pcmv_log10 <- log10(md$percent.cmv + fudge)
+## same HCMV gene list construction as analysis_soupx_sample_processing.R
+cmv.names <- read.table("merlin.gene.names")
+cmv.names <- c(cmv.names$V1, "EGFP")
+cmv.names <- gsub("_","-",cmv.names)
+cmv.names <- c(cmv.names, "RNA5.0","RNA4.9","RNA1.2","RNA2.7")
+counts <- counts[!rownames(counts) %in% cmv.names, ]
 
-  find_local_min <- function(x) {
-    des  <- density(x)
-    mins <- des$x[which(diff(sign(diff(des$y))) == 2) + 1]
-    if (length(mins) == 0) NA_real_ else mins[1]
-  }
+st <- as.character(md$Infection_state_bkgd)   # Mock / Bystander / Bystander_bkgd / Infected
 
-  inf.samples <- sort(unique(md$orig.ident[!md$is_mock]))
-  all.mins <- list()
-  thr <- sapply(inf.samples, function(s) {
-    x <- md$pcmv_log10[md$orig.ident == s & md$percent.cmv > 0]
-    des <- density(x)
-    all.mins[[s]] <<- des$x[which(diff(sign(diff(des$y))) == 2) + 1]
-    find_local_min(x)
-  })
-  print(all.mins)   # inspect: if mins[1] is a small dip, override in manual.thr
-  if (length(manual.thr)) thr[names(manual.thr)] <- manual.thr
-  if (any(is.na(thr))) {
-    stop("No local minimum found for: ",
-         paste(names(thr)[is.na(thr)], collapse = ", "),
-         " -> set these in manual.thr")
-  }
-
-  thr.tab <- data.frame(sample = names(thr),
-                        threshold_log10 = thr,
-                        threshold_pct = 10^thr - fudge)
-  print(thr.tab)
-  write.table(thr.tab, file.path(outdir, "infection_thresholds.tsv"),
-              sep = "\t", quote = FALSE, row.names = FALSE)
-
-  md$Infection_state <- "Mock"
-  inf <- !md$is_mock
-  md$Infection_state[inf & md$percent.cmv == 0] <- "Bystander"
-  pos <- inf & md$percent.cmv > 0
-  md$Infection_state[pos] <- ifelse(
-    md$pcmv_log10[pos] > thr[md$orig.ident[pos]], "High", "Marginal")
-
-  # QC plot: Fig 3A-style histograms with thresholds
-  p <- ggplot(md[pos, ], aes(pcmv_log10)) +
-    geom_histogram(bins = 50, fill = "grey40") +
-    geom_vline(data = thr.tab, aes(xintercept = threshold_log10),
-               colour = "red", linetype = 2) +
-    facet_wrap(~orig.ident, scales = "free_y", nrow = 2,
-               labeller = labeller(orig.ident = function(x) x)) +
-    labs(x = "log10(% viral transcripts + fudge)", y = "cells") +
-    theme_bw()
-  ggsave(file.path(outdir, "plots", "infection_threshold_hist.pdf"),
-         p, width = 12, height = 5)
-}
-
-md$Infection_state <- factor(md$Infection_state,
-                             levels = c("Mock", "Bystander", "Marginal", "High"))
-print(table(md$orig.ident, md$Infection_state))
-obj$Infection_state <- md$Infection_state
-saveRDS(obj, "analysis_Robjects/cmv.srt.soupx.filt.infstate.rds")
-
-## ---- host count matrix (HCMV genes removed) ---------------------------------
-counts.all  <- GetAssayData(obj, assay = "RNA", layer = "counts")
-host.genes  <- setdiff(rownames(counts.all), cmv.names)
-counts.host <- counts.all[host.genes, ]
-lib.host    <- colSums(counts.host)   # library size on host genes only
-rm(counts.all); gc()
-
-## ---- edgeR DE ----------------------------------------------------------------
-run_edger <- function(case, ref) {
-  cells <- rownames(md)[md$Infection_state %in% c(case, ref)]
-  grp   <- factor(as.character(md[cells, "Infection_state"]), levels = c(ref, case))
-  cnt   <- counts.host[, cells, drop = FALSE]
-
-  keep <- rowSums(cnt > 0) >= min.pct * length(cells)
-  cnt  <- cnt[keep, ]
-
-  pct.case <- rowSums(cnt[, grp == case] > 0) / sum(grp == case)
-  pct.ref  <- rowSums(cnt[, grp == ref]  > 0) / sum(grp == ref)
-
-  y <- DGEList(counts = as.matrix(cnt), group = grp,
-               lib.size = lib.host[cells])
-  y <- calcNormFactors(y, method = "TMMwsp")   # TMMwsp copes with sparse cells
-  design <- model.matrix(~ grp)
-  y   <- estimateDisp(y, design)
-  fit <- glmQLFit(y, design)
-  qlf <- glmQLFTest(fit, coef = 2)
-
-  tab <- topTags(qlf, n = Inf, sort.by = "PValue")$table
-  tab$gene     <- rownames(tab)
-  tab$pct.case <- pct.case[tab$gene]
-  tab$pct.ref  <- pct.ref[tab$gene]
-  tab$DE <- "NS"
-  tab$DE[tab$logFC >  lfc.cut & tab$FDR < fdr.cut] <- "Up"
-  tab$DE[tab$logFC < -lfc.cut & tab$FDR < fdr.cut] <- "Down"
-  tab[, c("gene", "logFC", "logCPM", "F", "PValue", "FDR",
-          "pct.case", "pct.ref", "DE")]
-}
-
-volcano <- function(tab, title, n.lab = 20) {
-  tab$nlog10FDR <- -log10(pmax(tab$FDR, .Machine$double.xmin))
-  lab <- bind_rows(
-    tab %>% filter(DE == "Up")   %>% arrange(FDR, desc(logFC)) %>% head(n.lab),
-    tab %>% filter(DE == "Down") %>% arrange(FDR, logFC)       %>% head(n.lab))
-  ggplot(tab, aes(logFC, nlog10FDR, colour = DE)) +
-    geom_point(size = 0.6) +
-    geom_vline(xintercept = c(-lfc.cut, lfc.cut), linetype = 2, colour = "grey50") +
-    geom_hline(yintercept = -log10(fdr.cut), linetype = 2, colour = "grey50") +
-    geom_text_repel(data = lab, aes(label = gene), size = 2.5,
-                    max.overlaps = Inf, show.legend = FALSE) +
-    scale_colour_manual(values = c(Down = "#2166AC", NS = "grey75", Up = "#B2182B")) +
-    labs(title = title, x = "log2 fold change", y = "-log10 FDR") +
-    theme_bw()
-}
-
-## case vs reference (positive logFC = higher in case), as in Fig 4A-D
-comps <- list(
-  High_vs_Mock          = c("High",      "Mock"),
-  Marginal_vs_Mock      = c("Marginal",  "Mock"),
-  Bystander_vs_Mock     = c("Bystander", "Mock"),
-  High_vs_Bystander     = c("High",      "Bystander"),
-  Marginal_vs_Bystander = c("Marginal",  "Bystander")   # reported as no DEGs
+## ---- the 8 tests ------------------------------------------------------------
+## name = file prefix; cells = tested cells; grp = labels; id = contrast label
+TESTS <- list(
+  `1` = list(cells = st %in% c("Bystander", "Infected"),                 # Infected vs Bystander (no HCMV reads)
+             grp = st, id = "Infected"),
+  `2` = list(cells = st %in% c("Mock", "Bystander", "Infected"),         # Infected vs Mock + Bystander (no HCMV reads)
+             grp = ifelse(st == "Infected", "Yes_CMV", "No_CMV"), id = "Yes_CMV"),  # NOT virus.presence: 1 Mock cell has HCMV reads
+  # `3` = High_CMV: definition still unknown -- cells = virus.presence == "yes" (3326/3327 cells, 11114 genes)
+  `4` = list(cells = st %in% c("Mock", "Bystander", "Infected"),         # Bystander vs Mock + Infected
+             grp = st, id = "Bystander"),
+  `5` = list(cells = st %in% c("Mock", "Bystander_bkgd"),                # Bystander_bkgd vs Mock
+             grp = st, id = "Bystander_bkgd"),
+  `6` = list(cells = st %in% c("Mock", "Infected"),                      # Infected vs Mock
+             grp = st, id = "Infected"),
+  `7` = list(cells = st %in% c("Bystander", "Infected"),                 # identical to test 1 (original files identical)
+             grp = st, id = "Infected"),
+  `8` = list(cells = md$Infection_state == "Bystander",                  # Bystander_bkgd vs Bystander (no HCMV reads)
+             grp = st, id = "Bystander_bkgd")
 )
 
-de.res <- list()
-for (nm in names(comps)) {
-  message("edgeR: ", nm)
-  tab <- run_edger(comps[[nm]][1], comps[[nm]][2])
-  de.res[[nm]] <- tab
-  write.table(tab, file.path(outdir, paste0("DE_", nm, ".tsv")),
-              sep = "\t", quote = FALSE, row.names = FALSE)
-  ggsave(file.path(outdir, "plots", paste0("volcano_", nm, ".pdf")),
-         volcano(tab, nm), width = 7, height = 6)
-  message(sprintf("  %s: %d up, %d down", nm,
-                  sum(tab$DE == "Up"), sum(tab$DE == "Down")))
-}
-saveRDS(de.res, file.path(outdir, "DE_results_list.rds"))
-
-## ---- overlaps among the three vs-Mock comparisons (Fig 4I/J) ---------------
-vs.mock <- c("High_vs_Mock", "Marginal_vs_Mock", "Bystander_vs_Mock")
-for (dir in c("Up", "Down")) {
-  sets <- lapply(de.res[vs.mock], function(t) t$gene[t$DE == dir])
-  all.g <- unique(unlist(sets))
-  memb <- data.frame(gene = all.g,
-                     sapply(sets, function(s) all.g %in% s), check.names = FALSE)
-  memb$pattern <- apply(memb[, vs.mock], 1,
-                        function(r) paste(vs.mock[r], collapse = "&"))
-  write.table(memb, file.path(outdir, paste0("overlap_vsMock_", dir, ".tsv")),
-              sep = "\t", quote = FALSE, row.names = FALSE)
-  print(table(memb$pattern))
+for (nm in names(TESTS)) {
+  t <- TESTS[[nm]]
+  pd <- md[t$cells, ]
+  pd$test <- nm
+  pd$DEgrp <- t$grp[t$cells]
+  input <- construct_ex_sc(as.matrix(counts[, rownames(pd)]))
+  findDEgenes(input, pd = pd, DEgroup = "DEgrp", contrastID = t$id, facet_by = "test",
+              minCells = 0.1, outdir = OUTDIR, outsuffix = "edgeRDEresults.tsv")
 }
 
-writeLines(capture.output(sessionInfo()), file.path(outdir, "sessionInfo.txt"))
+## ---- compare with original files --------------------------------------------
+sig <- function(d) rownames(d)[abs(d$logFC) > 1 & d$FDR < 0.05]
+report <- do.call(rbind, lapply(list.files(OUTDIR, "_edgeRDEresults.tsv$"), function(f) {
+  a <- read.delim(file.path(OUTDIR, f)); b <- read.delim(f); g <- rownames(b)
+  data.frame(file = f, same_genes = setequal(rownames(a), g),
+             max_abs_dlogFC = signif(max(abs(a[g, "logFC"] - b$logFC)), 3),
+             max_abs_dlogCPM = signif(max(abs(a[g, "logCPM"] - b$logCPM)), 3),
+             sig_orig = length(sig(b)), sig_new = length(sig(a)),
+             sig_shared = length(intersect(sig(a), sig(b))))
+}))
+print(report, row.names = FALSE)
+write.table(report, "DE_repro/reproduction_report.tsv", sep = "\t", quote = FALSE, row.names = FALSE)
+writeLines(capture.output(sessionInfo()), "DE_repro/sessionInfo.txt")
